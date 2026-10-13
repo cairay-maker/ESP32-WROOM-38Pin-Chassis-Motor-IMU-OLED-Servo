@@ -1,70 +1,177 @@
-=== src/main.cpp ===
+=== src/bk-bf-simplemotor ===
 #include <Arduino.h>
-#include <Wire.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
-#include "hal/MotorDrive.h"
-#include "hal/IMUReader.h"
-#include "hal/OLEDHandler.h"
-#include "hal/ESPNowHandler.h"
-#include "MotionLogic.h"
+#include <Wire.h>
 
-MotorDrive motors;
-IMUReader imu;
-OLEDHandler oled;
+#include "hal/ServoHandler.h"
+#include "hal/ESPNowHandler.h"
+#include "hal/MotorDrive.h"
+
+ServoHandler legServos;
 ESPNowHandler radio;
-MotionLogic logic;
+MotorDrive motors;
+
+// Tracking for remote input deadbands
+float lastHeightOffset = -999.0f;
+float lastSplitOffset  = -999.0f;
 
 void setup() {
     Serial.begin(115200);
-    
-    // --- POWER UP WIFI & LOCK CHANNEL 1 ---
+    delay(1000);
+
+    Serial.println("\n=== Quadruped System Initializing ===");
+
+    // 1. WiFi & ESP-NOW Channel Lock
     WiFi.mode(WIFI_STA);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
 
-    // Initialize shared I2C bus for OLED and IMU before display startup
+    // 2. Shared I2C Bus for PCA9685 Servos (SDA: 21, SCL: 22)
     Wire.begin(21, 22);
-    Wire.setClock(400000);
+    Wire.setClock(100000);
 
+    // 3. Initialize Hardware Modules
+    legServos.begin();
+    legServos.setNeutralPose();
+    radio.begin();
     motors.init();
-    oled.begin();
-    radio.begin(); 
-    
-    if (imu.begin()) {
-        oled.clearScreen();
-        oled.drawCenteredText("CALIBRATING...", 28, 1);
-        oled.updateDisplay();
-        imu.calibrate();
-    }
+
+    Serial.println(">>> System Ready.");
+
+    // --- MOTOR TEST DIRECTION ROUTINE ---
+    // Runs all four motors at a slow PWM speed (100) for 5 seconds
+    Serial.println("\n-------------------------------------------");
+    Serial.println(">>> STARTING MOTOR DIRECTION TEST (SPEED = 100)");
+    Serial.println(">>> Observe each wheel and note if it moves FORWARD or BACKWARD.");
+    Serial.println("-------------------------------------------\n");
+
+    motors.drive(100, 100, 100, 100); // Drive FL, FR, RL, RR at speed 100
+    delay(10000);                      // Run for 5 seconds
+    motors.stop();
+
+    Serial.println(">>> TEST COMPLETE: Motors Stopped.");
+    Serial.println(">>> Please report which wheels moved Forward and which moved Backward.");
 }
 
 void loop() {
-    imu.update();
-    
-    bool connected = radio.isConnected();
-    
-    if (connected) {
+    // 1. Non-blocking interleaved leg updates
+    legServos.update();
+
+    // 2. Process USB Serial commands (keyboard overrides)
+    legServos.processSerialCommands();
+
+    // 3. Process Wireless ESP-NOW Remote Commands
+    if (radio.isConnected()) {
         const PacketData& remote = radio.getLatestPacket();
+
+        float rawPL = remote.pL;
+        float rawPM = remote.pM;
+
+        // Snap-to-Neutral around 0.0 to prevent jitter
+        if (abs(rawPL) < 0.04f) rawPL = 0.0f;
+        if (abs(rawPM) < 0.04f) rawPM = 0.0f;
+
+        // 2 degrees per 0.1 step multiplier (x20)
+        float targetHeightOffset = round(rawPL * 20.0f);
+        float targetSplitOffset  = round(rawPM * 20.0f);
+
+        if (targetHeightOffset != lastHeightOffset || targetSplitOffset != lastSplitOffset) {
+            lastHeightOffset = targetHeightOffset;
+            lastSplitOffset  = targetSplitOffset;
+
+            legServos.applyPoseOffsets(targetHeightOffset, targetSplitOffset);
+
+            Serial.printf(">>> REMOTE INPUT: Height = %+.0f deg | Split = %+.0f deg\n", 
+                          targetHeightOffset, targetSplitOffset);
+        }
+    }
+}
+=== src/main.cpp ===
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <Wire.h>
+
+#include "hal/ServoHandler.h"
+#include "hal/ESPNowHandler.h"
+#include "hal/MotorDrive.h"
+#include "MotionLogic.h"
+
+ServoHandler legServos;
+ESPNowHandler radio;
+MotorDrive motors;
+MotionLogic logic;
+
+// Deadband tracker for height and split
+float lastHeightOffset = -999.0f;
+float lastSplitOffset  = -999.0f;
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("\n=== Quadruped System Initializing ===");
+
+    // 1. WiFi & ESP-NOW Channel Lock
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+
+    // 2. Shared I2C Bus for PCA9685 Servos
+    Wire.begin(21, 22);
+    Wire.setClock(100000);
+
+    // 3. Initialize Hardware Modules
+    legServos.begin();
+    legServos.setNeutralPose();
+    radio.begin();
+    motors.init();
+
+    Serial.println(">>> System Ready.");
+}
+
+void loop() {
+    // 1. Interleaved non-blocking servo movement updates
+    legServos.update();
+
+    // 2. Process USB Serial keyboard inputs
+    legServos.processSerialCommands();
+
+    // 3. Process Remote Control Data
+    if (radio.isConnected()) {
+        const PacketData& remote = radio.getLatestPacket();
+
+        // --- A. MECANUM WHEEL DRIVE LOGIC ---
         MotionLogic::CalculatedSpeeds speeds = logic.process(remote);
         motors.drive(speeds.fl, speeds.fr, speeds.rl, speeds.rr);
+
+        // --- B. SERVO POSE CONTROL (pL: Height, pM: Split) ---
+        float rawPL = remote.pL;
+        float rawPM = remote.pM;
+
+        // Snap-to-Neutral around 0.0 to eliminate jitter
+        if (abs(rawPL) < 0.04f) rawPL = 0.0f;
+        if (abs(rawPM) < 0.04f) rawPM = 0.0f;
+
+        // 2 degrees per 0.1 step multiplier (x20)
+        float targetHeightOffset = round(rawPL * 20.0f);
+        float targetSplitOffset  = round(rawPM * 20.0f);
+
+        if (targetHeightOffset != lastHeightOffset || targetSplitOffset != lastSplitOffset) {
+            lastHeightOffset = targetHeightOffset;
+            lastSplitOffset  = targetSplitOffset;
+
+            legServos.applyPoseOffsets(targetHeightOffset, targetSplitOffset);
+
+            Serial.printf(">>> REMOTE POSE: Height = %+.0f deg | Split = %+.0f deg\n", 
+                          targetHeightOffset, targetSplitOffset);
+        }
     } else {
+        // Safety stop if remote disconnects
         motors.stop();
-    }
-    
-    static unsigned long lastUpdate = 0;
-    if (millis() - lastUpdate > 66) { // 15 FPS
-        oled.clearScreen();
-        oled.drawWifiIcon(connected);
-        oled.drawRobotData(
-            imu.getPitch(), imu.getRoll(),
-            motors.getFLSpeed(), motors.getFRSpeed(),
-            motors.getRLSpeed(), motors.getRRSpeed()
-        );
-        oled.drawBalanceBar(imu.getRoll());
-        oled.updateDisplay();
-        lastUpdate = millis();
     }
 }
 === src/MotionLogic.cpp ===
@@ -72,11 +179,10 @@ void loop() {
 
 MotionLogic::MotionLogic() {}
 
-// Note the return type uses MotionLogic:: to tell the compiler where the struct is
 MotionLogic::CalculatedSpeeds MotionLogic::process(const PacketData& joyData) {
     CalculatedSpeeds s = {0, 0, 0, 0};
 
-    // Mapping normalized float (-1.0 to 1.0) to your legacy 500-scale
+    // Mapping normalized float (-1.0 to 1.0) to 500-scale
     float rawX = joyData.rx * 500.0f; 
     float rawY = joyData.ry * 500.0f;
 
@@ -84,8 +190,9 @@ MotionLogic::CalculatedSpeeds MotionLogic::process(const PacketData& joyData) {
     if (abs(rawX) <= DEAD_ZONE) rawX = 0;
     if (abs(rawY) <= DEAD_ZONE) rawY = 0;
 
-    float x = rawX * SCALE;
-    float y = rawY * SCALE;
+    // --- INVERT X SIGN TO FIX FLIPPED LEFT/RIGHT STRAFING ---
+    float x =  rawX * SCALE;
+    float y =  rawY * SCALE;
 
     // INNER ZONE: Forward/Backward or Point Turns
     if (abs(rawX) <= INNER_ZONE_LIMIT && abs(rawY) <= INNER_ZONE_LIMIT) {
@@ -98,7 +205,7 @@ MotionLogic::CalculatedSpeeds MotionLogic::process(const PacketData& joyData) {
             s.fr = s.rr = (int)-x;
         }
     } 
-    // OUTER ZONE: Full Mecanum movement
+    // OUTER ZONE: Full Mecanum Strafe movement
     else {
         float rot = (abs(rawY) > DEAD_ZONE) ? 0 : x * 0.2f;
         s.fl = (int)(y + x + rot);
@@ -121,7 +228,7 @@ MotionLogic::CalculatedSpeeds MotionLogic::process(const PacketData& joyData) {
 #include <Arduino.h>
 
 bool IMUReader::begin() {
-    Wire.begin(21, 22);
+
     Wire.setClock(400000);
 
     if (!lsm.begin_I2C()) return false;
@@ -194,6 +301,230 @@ void IMUReader::update() {
 
     // 5. Yaw Rate Smoothing
     filteredYawRate = (filteredYawRate * (1.0f - yawAlpha)) + (gz_deg * yawAlpha);
+}
+=== src/hal/ServoHandler.h ===
+#ifndef SERVO_HANDLER_H
+#define SERVO_HANDLER_H
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+#define JOINT_COUNT 4
+
+enum ServoJoint {
+    JOINT_FL = 0, // Calibrated Neutral: 130° (90° lift reference)
+    JOINT_FR = 1, // Calibrated Neutral: 100° (120° lift reference)
+    JOINT_RL = 2, // Calibrated Neutral: 110° (130° lift reference)
+    JOINT_RR = 3  // Calibrated Neutral: 122° (90° lift reference)
+};
+
+class ServoHandler {
+private:
+    Adafruit_PWMServoDriver _pwm;
+    
+    // Calibrated Neutral Angles
+    const float NEUTRAL_ANGLES[JOINT_COUNT] = {130.0f, 100.0f, 110.0f, 122.0f};
+
+    float _currentAngles[JOINT_COUNT] = {130.0f, 100.0f, 110.0f, 122.0f};
+    float _targetAngles[JOINT_COUNT]  = {130.0f, 100.0f, 110.0f, 122.0f};
+    
+    float _speedDegPerSec = 30.0f; // Default 30 deg/sec
+    bool _isEngaged = false;
+    unsigned long _lastUpdateMicros = 0;
+
+    // Round-robin index for interleaved stepping
+    int _interleavedLegIndex = 0;
+
+    uint16_t degreesToPWM(float degrees);
+
+public:
+    ServoHandler();
+    void begin();
+    void update();
+    void processSerialCommands();
+    void setNeutralPose();
+    void adjustHeight(float offsetDeg); // Handles UP / DN relative commands
+    void setEngaged(bool engage);
+    void applySplit(float offsetDeg); // Handles SPLIT:X roll/tilt commands
+    void applyPoseOffsets(float heightOffsetDeg, float splitOffsetDeg);
+};
+
+#endif
+=== src/hal/ServoHandler.cpp ===
+#include "ServoHandler.h"
+
+#define SERVOMIN 100
+#define SERVOMAX 500
+
+ServoHandler::ServoHandler() : _pwm(Adafruit_PWMServoDriver(0x40)) {}
+
+uint16_t ServoHandler::degreesToPWM(float degrees) {
+    degrees = constrain(degrees, 0.0f, 180.0f);
+    return map((long)(degrees * 10), 0, 1800, SERVOMIN, SERVOMAX);
+}
+
+void ServoHandler::begin() {
+    _pwm.begin();
+    _pwm.setOscillatorFrequency(27000000);
+    _pwm.setPWMFreq(50);
+    _lastUpdateMicros = micros();
+}
+
+void ServoHandler::setEngaged(bool engage) {
+    _isEngaged = engage;
+    if (_isEngaged) {
+        for (int i = 0; i < JOINT_COUNT; i++) {
+            _targetAngles[i] = _currentAngles[i];
+            _pwm.setPWM(i, 0, degreesToPWM(_currentAngles[i]));
+        }
+        Serial.println(">>> SERVOS: ENGAGED");
+    } else {
+        for (int i = 0; i < JOINT_COUNT; i++) {
+            _pwm.setPWM(i, 0, 0); // De-energize PWM outputs
+        }
+        Serial.println(">>> SERVOS: RELAXED");
+    }
+}
+
+void ServoHandler::setNeutralPose() {
+    for (int i = 0; i < JOINT_COUNT; i++) {
+        _targetAngles[i] = NEUTRAL_ANGLES[i];
+    }
+    Serial.println(">>> POSE: NEUTRAL RESTORED");
+}
+
+void ServoHandler::adjustHeight(float offsetDeg) {
+    // offsetDeg > 0 raises body (UP), offsetDeg < 0 lowers body (DN)
+    
+    // FL & RR: Subtract offset to raise leg
+    _targetAngles[JOINT_FL] = constrain(NEUTRAL_ANGLES[JOINT_FL] - offsetDeg, 0.0f, 180.0f);
+    _targetAngles[JOINT_RR] = constrain(NEUTRAL_ANGLES[JOINT_RR] - offsetDeg, 0.0f, 180.0f);
+
+    // FR & RL: Add offset due to mirrored mounting geometry
+    _targetAngles[JOINT_FR] = constrain(NEUTRAL_ANGLES[JOINT_FR] + offsetDeg, 0.0f, 180.0f);
+    _targetAngles[JOINT_RL] = constrain(NEUTRAL_ANGLES[JOINT_RL] + offsetDeg, 0.0f, 180.0f);
+
+    Serial.printf(">>> HEIGHT TARGET: Offset %.1f deg relative to Neutral\n", offsetDeg);
+}
+
+void ServoHandler::applySplit(float offsetDeg) {
+    // FL & RR: Lower body by adding offsetDeg (- relative shift)
+    _targetAngles[JOINT_FL] = constrain(NEUTRAL_ANGLES[JOINT_FL] + offsetDeg, 0.0f, 180.0f);
+    _targetAngles[JOINT_RR] = constrain(NEUTRAL_ANGLES[JOINT_RR] + offsetDeg, 0.0f, 180.0f);
+
+    // FR & RL: Raise body by adding offsetDeg (+ relative shift due to opposite side)
+    _targetAngles[JOINT_FR] = constrain(NEUTRAL_ANGLES[JOINT_FR] + offsetDeg, 0.0f, 180.0f);
+    _targetAngles[JOINT_RL] = constrain(NEUTRAL_ANGLES[JOINT_RL] + offsetDeg, 0.0f, 180.0f);
+
+    Serial.printf(">>> SPLIT TARGET: Offset %.1f deg (FR/RL raised, FL/RR lowered)\n", offsetDeg);
+}
+
+void ServoHandler::applyPoseOffsets(float heightOffsetDeg, float splitOffsetDeg) {
+    // 1. Automatically engage servos if receiving remote command
+    if (!_isEngaged) {
+        setEngaged(true);
+    }
+
+    // 2. Calculate combined height & split target angles using mirrored signs
+    // FL & RR: Subtract height, Add split
+    float flTarget = NEUTRAL_ANGLES[JOINT_FL] - heightOffsetDeg + splitOffsetDeg;
+    float rrTarget = NEUTRAL_ANGLES[JOINT_RR] - heightOffsetDeg + splitOffsetDeg;
+
+    // FR & RL: Add height, Add split (mirrored geometry)
+    float frTarget = NEUTRAL_ANGLES[JOINT_FR] + heightOffsetDeg + splitOffsetDeg;
+    float rlTarget = NEUTRAL_ANGLES[JOINT_RL] + heightOffsetDeg + splitOffsetDeg;
+
+    // 3. Set constrained target angles
+    _targetAngles[JOINT_FL] = constrain(flTarget, 0.0f, 180.0f);
+    _targetAngles[JOINT_RR] = constrain(rrTarget, 0.0f, 180.0f);
+    _targetAngles[JOINT_FR] = constrain(frTarget, 0.0f, 180.0f);
+    _targetAngles[JOINT_RL] = constrain(rlTarget, 0.0f, 180.0f);
+}
+
+void ServoHandler::processSerialCommands() {
+    if (!Serial.available()) return;
+
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    input.toUpperCase();
+
+    if (input.length() == 0) return;
+
+    if (input == "OFF") {
+        setEngaged(false);
+    } else if (input == "ON") {
+        setEngaged(true);
+    } else if (input == "NEUTRAL") {
+        setNeutralPose();
+    } else if (input.indexOf(':') > 0) {
+        String key = input.substring(0, input.indexOf(':'));
+        float val = input.substring(input.indexOf(':') + 1).toFloat();
+
+        if (!_isEngaged) setEngaged(true);
+
+        // --- FIXED CHECK FOR UP / DN / SPEED ---
+        if (key == "UP") {
+            adjustHeight(val);    // e.g., UP:10 -> Raise chassis 10 deg
+        } else if (key == "DN") {
+            adjustHeight(-val);   // e.g., DN:10 -> Lower chassis 10 deg
+        } else if (key == "SPLIT") {
+            applySplit(val);      // e.g., SPLIT:10 -> Raise FR/RL 10 deg, Lower FL/RR 10 deg
+        } else if (key == "SPEED") {
+            _speedDegPerSec = constrain(val, 5.0f, 300.0f);
+            Serial.printf(">>> Speed set to %.1f deg/sec\n", _speedDegPerSec);
+        } else {
+            // Check individual joint channels
+            int ch = -1;
+            if (key == "FL") ch = JOINT_FL;
+            else if (key == "FR") ch = JOINT_FR;
+            else if (key == "RL") ch = JOINT_RL;
+            else if (key == "RR") ch = JOINT_RR;
+
+            if (ch >= 0) {
+                _targetAngles[ch] = constrain(val, 0.0f, 180.0f);
+                Serial.printf(">>> Joint %s target set to %.1f deg\n", key.c_str(), val);
+            } else {
+                Serial.println("!!! Unknown command. Type HELP for options.");
+            }
+        }
+    } else {
+        Serial.println("!!! Unknown command. Type HELP for options.");
+    }
+}
+
+void ServoHandler::update() {
+    unsigned long currentMicros = micros();
+    float dt = (currentMicros - _lastUpdateMicros) / 1000000.0f;
+    _lastUpdateMicros = currentMicros;
+
+    if (!_isEngaged) return;
+
+    float maxStep = _speedDegPerSec * dt;
+
+    // Round-robin Interleaved Stepping
+    for (int count = 0; count < JOINT_COUNT; count++) {
+        int leg = (_interleavedLegIndex + count) % JOINT_COUNT;
+        float diff = _targetAngles[leg] - _currentAngles[leg];
+
+        if (abs(diff) > 0.05f) {
+            // Nudge by up to 1.0 degree or maxStep, whichever is smaller
+            float step = (diff > 0) ? min(1.0f, maxStep) : max(-1.0f, -maxStep);
+            _currentAngles[leg] += step;
+
+            // Clamp precisely to target
+            if ((diff > 0 && _currentAngles[leg] > _targetAngles[leg]) ||
+                (diff < 0 && _currentAngles[leg] < _targetAngles[leg])) {
+                _currentAngles[leg] = _targetAngles[leg];
+            }
+
+            _pwm.setPWM(leg, 0, degreesToPWM(_currentAngles[leg]));
+
+            // Move index to the next leg for the following loop iteration
+            _interleavedLegIndex = (leg + 1) % JOINT_COUNT;
+            break; // Exit after updating 1 joint step
+        }
+    }
 }
 === src/hal/ESPNowHandler.cpp ===
 #include "hal/ESPNowHandler.h"
@@ -281,15 +612,7 @@ private:
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
-
-// The exact data structure sent by your Controller
-typedef struct {
-    float lx, ly, rx, ry;    // Joysticks (-1.0 to 1.0)
-    float pL, pM, pR;        // Potentiometers
-    float roll, pitch, yaw;  // IMU Data
-    int16_t encL, encR;      // Encoders
-    uint32_t buttons;        // Button bitmask
-} PacketData;
+#include "PacketData.h"
 
 class ESPNowHandler {
 public:
@@ -346,15 +669,18 @@ private:
 #include <Arduino.h>
 #include <FS_MX1508.h>
 
-// Your Final Pin Assignments
-#define FR_F 13
-#define FR_R 12
-#define FL_F 14
-#define FL_R 27
-#define RR_F 26
-#define RR_R 25
-#define RL_F 33
-#define RL_R 32
+// Your Active GPIO Pin Assignments
+#define FR_F 19  // IN3
+#define FR_R 18  // IN4
+
+#define RR_F 27  // IN1
+#define RR_R 14  // IN2
+
+#define FL_F 25  // IN3
+#define FL_R 26  // IN4
+
+#define RL_F 23  // IN1
+#define RL_R 4   // IN2 (GPIO 04)
 
 class MotorDrive {
 public:
@@ -363,7 +689,7 @@ public:
     void drive(int fl, int fr, int rl, int rr);
     void stop();
 
-    // Getters for OLED telemetry
+    // Getters for OLED / telemetry
     int getFLSpeed() { return _fl; }
     int getFRSpeed() { return _fr; }
     int getRLSpeed() { return _rl; }
@@ -396,11 +722,18 @@ void MotorDrive::setMotorSpeed(MX1508& m, int speed) {
 }
 
 void MotorDrive::drive(int fl, int fr, int rl, int rr) {
-    _fl = fl; _fr = fr; _rl = rl; _rr = rr;
+    _fl = fl; 
+    _fr = fr; 
+    _rl = rl; 
+    _rr = rr;
+
+    // Left motors use positive sign
     setMotorSpeed(motorFL, _fl);
-    setMotorSpeed(motorFR, _fr);
     setMotorSpeed(motorRL, _rl);
-    setMotorSpeed(motorRR, _rr);
+
+    // Right motors are physically mirrored, so negate input sign
+    setMotorSpeed(motorFR, -_fr);
+    setMotorSpeed(motorRR, -_rr);
 }
 
 void MotorDrive::stop() {
@@ -486,6 +819,7 @@ void OLEDHandler::drawCenteredText(const char* text, int y, int size) {
 
 #include <Arduino.h>
 #include "hal/ESPNowHandler.h"
+#include "PacketData.h"
 
 class MotionLogic {
 public:
@@ -507,54 +841,68 @@ private:
 
 #endif
 === src/README.md ===
-# Project: ESP32-WROOM-30Pin-Mecanum-IMU-OLED
+Script to Concatenate all the code for Gemini
+    find src -type f ! -name "AllCode.txt" -exec sh -c 'echo "=== $1 ==="; cat "$1"; echo' _ {} \; > AllCode.txt	
 
-## Overview
-A dual-phase robotics project utilizing an ESP32 to drive a 4-wheel Mecanum platform via ESP-NOW remote control, evolving into a self-balancing inverted pendulum robot.
+Project: ESP32-WROOM-30Pin-Mecanum-IMU-OLED
 
-## Hardware Stack
-- **MCU:** ESP32-WROOM-38 Pin (Dual Core) https://lastminuteengineers.com/esp32-pinout-reference/
-- **Display:** 1.5" 128x128 OLED (SSD1327-compatible I2C)
-- **IMU:** LSM6DS3 (6-Axis)
-- **Servo Driver:** PCA9685 I2C PWM
-- **Drivers:** 2x MX1508 (Mini L298N)
-- **Motors:** 4x N20 (60 RPM) with 48mm Mecanum Wheels
 
-## Pin Mapping
+Hardware Overview & System ArchitectureController: 
+    ESP32 NodeMCU (38-Pin)
+    Wireless Protocol: ESP-NOW (for real-time remote controller telemetry)
+    Display: 1.5" SSD1327 OLED ($128 \times 128$, I2C)
+    IMU: Adafruit LSM6DS (6-DOF, I2C)
+    Servo Driver: PCA9685 16-Channel PWM Driver (I2C)
+    Motor Drivers: 2x MX1508 / Mini L298N (Dual H-Bridge)
+    AI Camera / Host Link: Hardware UART2 (HuskyLens / Raspberry Pi interface)
+    Wheels: 80mm large mecanum wheels
+    Servo Motor: MG995 x 4 for leg joints
 
-GPIO 6 to 11: Internal Flash Memory. If you connect anything here, the ESP32 won't boot.
-GPIO 0: Strapping pin (used to enter "Download Mode"). If held LOW at startup, the code won't run.
-GPIO 2: Often connected to the onboard LED. Best to leave it as a status light.
-GPIO 34, 35, 36, 39: Input-Only. These cannot output a PWM signal to a motor driver.
+ESP-NOW & ADC Conflicts: 
+    Utilizing Wi-Fi / ESP-NOW disables ESP32 ADC2 (GPIOs 0, 2, 4, 12–15, 25–27) for analog inputs. All analog sensors (e.g., battery voltage dividers) are mapped exclusively to ADC1 pins (GPIOs 32–39).	
 
-- I2C (OLED/IMU): SDA:21, SCL:22
-- Motors FR: 13, 12 (+,-)
-- Motors FL: 14, 27 (+,-)
-- Motors RR: 26, 25 (+,-)
-- Motors RL: 33, 32 (+,-)
+    GPIO 6 to 11: Internal Flash Memory. If you connect anything here, the ESP32 won't boot.
+    GPIO 0: Strapping pin (used to enter "Download Mode"). If held LOW at startup, the code won't run.
+    GPIO 2: Often connected to the onboard LED. Best to leave it as a status light.
+    GPIO 34, 35, 36, 39: Input-Only. These cannot output a PWM signal to a motor driver.
 
-Project Plan: Phase 1 (Mecanum Control)
-To keep the momentum, we will follow a "Software First" approach using the same packet structure from your Controller project.
+GPIO Pin	Function / Target Component	Direction / Notes								
+    GPIO 21	I2C SDA (OLED, IMU, PCA9685, Color Sensor)	Shared I2C Data Bus								
+    GPIO 22	I2C SCL (OLED, IMU, PCA9685, Color Sensor)	Shared I2C Clock Bus								
+    GPIO 16	UART2 RX2 (HuskyLens TX / Raspberry Pi TX)	Hardware Serial Receive								
+    GPIO 17	UART2 TX2 (HuskyLens RX / Raspberry Pi RX)	Hardware Serial Transmit								
+    
+Motor Drive:
 
-Week 1: Foundations & Communication
-Step 1: Setup the platformio.ini with FS_MX1508, Adafruit LSM6DS3, Adafruit SSD1327, and Adafruit PWM Servo Driver.
+    
+    
+    GPIO 18	Motor FR - IN4 Output / PWM	
+    GPIO 19	Motor FR - IN3 Output / PWM
 
-Step 2: Port your PacketData struct to the Receiver code.
+    GPIO 14	Motor RR - IN2 Output / PWM
+    GPIO 27	Motor RR - IN1 Output / PWM
 
-Step 3: Establish the ESP-NOW "Handshake." Use the OLED to display the X/Y Joystick values being received from your handheld controller.
+    GPIO 26	Motor FL - IN4 Output / PWM
+    GPIO 25	Motor FL - IN3 Output / PWM
 
-Week 2: Kinematics (The "Mecanum" Math)
-Step 4: Implement the Mecanum drive algorithm. This converts Joystick X (Slide), Y (Forward), and Z (Spin) into 4 different motor speeds.
+    GPIO 04	Motor RL - IN2 Output / PWM								
+    GPIO 23	Motor RL - IN1 Output / PWM							
+    								
+PCA9685 Servo Channel Mapping										
+										
+All leg and upper-body servos are offloaded to the PCA9685 via I2C 
+										
+Channel	Assignment	Function								
+    Ch 0	Front-Left Leg	Joint Servo 1								
+    Ch 1	Front-Right Leg	Joint Servo 2								
+    Ch 2	Rear-Left Leg	Joint Servo 3								
+    Ch 3	Rear-Right Leg	Joint Servo 4								
+								
+									
 
-Step 5: Software "Bench Test." Watch the OLED/Serial monitor to ensure the motors think they are spinning the right way before putting it on the floor.
 
-Week 3: Hardware Integration
-Step 6: Wiring and Power. (We will discuss how to power the ESP32 and Motors separately to prevent crashes).
 
-Step 7: First Drive. Tuning the "deadzone" of your handheld joysticks so the robot doesn't crawl away on its own.
 
-Transitioning to Phase 2 (Self-Balance)
-Self-balancing requires very high-speed PID loops. Because we used a Mecanum setup, we will likely "lock" the strafing and treat it as a 2-wheel balancer later, or use the 4 wheels to create a wider, more stable balancing base.
 === src/PacketData.h ===
 #ifndef PACKET_DATA_H
 

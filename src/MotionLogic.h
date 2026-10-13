@@ -7,20 +7,20 @@
 
 class MotionLogic {
 public:
-    // Struct defined inside the class to prevent global scope naming conflicts
     struct CalculatedSpeeds {
         int fl, fr, rl, rr;
     };
 
     MotionLogic();
     
-    // Returns the nested struct
     CalculatedSpeeds process(const PacketData& joyData);
 
 private:
     const int DEAD_ZONE = 10;
     const int INNER_ZONE_LIMIT = 495;
-    const float SCALE = 255.0 / 500.0;
+    
+    // Scale factor for 30% max speed cap (76 PWM out of 255)
+    const float SCALE = 127.0f / 500.0f;
 };
 
 #endif
